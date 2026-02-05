@@ -3,9 +3,9 @@ const settings = {
   packname: 'MEGA-MD',
   author: '‎GlobalTechInfo',
   timeZone: 'Asia/Karachi',
-  botName: "MEGA-MD", // your bot name
-  botOwner: 'Qasim Ali', // set your name
-  ownerNumber: '923051391007', // Set your number here without + symbol, just add country code & number without any space
+  botName: "ZOHA-MD", // your bot name
+  botOwner: 'KINJI HAKARI', // set your name
+  ownerNumber: '923400071098', // Set your number here without + symbol, just add country code & number without any space
   giphyApiKey: 'qnl7ssQChTdPjsKta2Ax2LMaGXz303tq',
   commandMode: "public",
   maxStoreMessages: 20,
