@@ -22,7 +22,7 @@ const NodeCache = require("node-cache");
 const pino = require("pino");
 const mongoose = require("mongoose");
 
-// Import the MongoDB Auth Library
+// Import the permanent storage library
 const { useMongoDBAuthState } = require('./lib/mongo_auth'); 
 
 const store = require('./lib/lightweight_store');
@@ -38,42 +38,46 @@ const {
 const settings = require('./settings');
 const commandHandler = require('./lib/commandHandler');
 
-// Initial Setup
+// Initial Setup & Database Write Interval
 store.readFromFile();
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000);
 commandHandler.loadCommands();
 
-// RAM Monitoring for Sevalla (Prevents OOM crashes)
+// RAM & Performance Management for Sevalla
 setInterval(() => {
     if (global.gc) global.gc();
+}, 60_000);
+
+setInterval(() => {
     const used = process.memoryUsage().rss / 1024 / 1024;
-    if (used > 450) {
-        console.log(chalk.red("⚠️ Memory high, restarting..."));
+    if (used > 480) {
+        console.log(chalk.red("⚠️ Memory limit reached. Performing emergency restart..."));
         process.exit(1);
     }
 }, 30_000);
 
-// Server for Port 8080/3000 Uptime
-server.listen(PORT, () => printLog('success', `Bot server alive on port ${PORT}`));
+// Keep Port 3000/8080 Open for Uptime
+server.listen(PORT, () => printLog('success', `Uptime Server running on port ${PORT}`));
 
 async function startQasimDev() {
     try {
         const mongoUrl = global.mongodb || process.env.MONGO_URL;
         
-        // 1. HARD WAIT: Force connection before doing anything else
-        console.log(chalk.yellow("📡 Connecting to Database..."));
+        // 1. HARD LOCK: Establishing Database Connection First
+        console.log(chalk.yellow("📡 Phase 1: Establishing Stable Database Connection..."));
         if (!mongoUrl) {
-            console.error(chalk.red("❌ Error: MONGO_URL not found in config.js or ENV."));
+            console.error(chalk.red("❌ Error: MONGO_URL is missing in your config!"));
             return;
         }
-        await mongoose.connect(mongoUrl);
         
-        // 2. AUTH SYNC: Ensure state and creds are ready
-        const { state, saveCreds } = await useMongoDBAuthState(mongoUrl);
-        console.log(chalk.green("✅ Database Synced. Initializing Connection..."));
+        await mongoose.connect(mongoUrl);
+        console.log(chalk.green("✅ Phase 2: Database Connected. Syncing Auth State..."));
 
+        const { state, saveCreds } = await useMongoDBAuthState(mongoUrl);
         const { version } = await fetchLatestBaileysVersion();
         const msgRetryCounterCache = new NodeCache();
+
+        // Get pairing number from Environment Variables
         let phoneNumber = process.env.PAIRING_NUMBER || global.PAIRING_NUMBER || "";
 
         const QasimDev = makeWASocket({
@@ -96,21 +100,26 @@ async function startQasimDev() {
             msgRetryCounterCache,
         });
 
-        // 3. SECURE PAIRING: 15s delay to ensure noiseKey isn't undefined
+        // 2. MAXIMUM STABILITY LOCK: 60-second delay for Pairing Code
         if (phoneNumber && !state.creds.registered) {
+            console.log(chalk.blue("⏳ Stability Lock: Waiting 60 seconds for database replication..."));
             setTimeout(async () => {
                 try {
-                    console.log(chalk.cyan("🔑 Generating Pairing Code..."));
+                    console.log(chalk.cyan("🔑 Handshaking and Requesting Pairing Code..."));
                     let code = await QasimDev.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
                     code = code?.match(/.{1,4}/g)?.join("-") || code;
-                    console.log(chalk.bgGreen.black(`\n YOUR CODE: `), chalk.white.bold(code), `\n`);
+                    console.log(chalk.black(chalk.bgGreen(`\n 🔑 YOUR STABLE PAIRING CODE: `)), chalk.white.bold(code), `\n`);
                 } catch (e) { 
-                    console.log(chalk.red("Pairing Error:"), e.message); 
+                    console.log(chalk.red("❌ Pairing Error (Keys not ready):"), e.message); 
                 }
-            }, 15000);
+            }, 60000); // 60s delay to prevent "Received undefined" errors
         }
 
-        QasimDev.ev.on('creds.update', saveCreds);
+        // Auto-Save Credentials
+        QasimDev.ev.on('creds.update', async () => {
+            await saveCreds();
+        });
+
         store.bind(QasimDev.ev);
 
         QasimDev.ev.on('connection.update', async (update) => {
@@ -121,29 +130,32 @@ async function startQasimDev() {
             }
 
             if (connection === 'open') {
-                printLog('success', '✅ SUCCESS: Connected! Session saved to MongoDB.');
+                printLog('success', '✅ SUCCESS: Connected! Your bot is now permanent.');
             }
 
             if (connection === 'close') {
                 let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
                 if (reason !== DisconnectReason.loggedOut) {
-                    console.log(chalk.cyan("🔌 Connection lost. Reconnecting..."));
+                    console.log(chalk.yellow("🔌 Connection lost. Cooling down for 10s before restart..."));
+                    await delay(10000);
                     startQasimDev();
                 } else {
-                    printLog('error', '⚠️ Logged out. Clean MongoDB and re-pair.');
+                    printLog('error', '⚠️ Session Logged Out. Please clear MongoDB and re-pair.');
                 }
             }
         });
 
-        // Event Handling
+        // Message & Event Listeners
         QasimDev.ev.on('messages.upsert', async (chatUpdate) => {
             try {
                 const mek = chatUpdate.messages[0];
                 if (!mek.message) return;
+                
                 if (mek.key && mek.key.remoteJid === 'status@broadcast') {
                     await handleStatus(QasimDev, chatUpdate);
                     return;
                 }
+                
                 await handleMessages(QasimDev, chatUpdate);
             } catch (err) { console.error(err); }
         });
@@ -168,10 +180,10 @@ async function startQasimDev() {
         QasimDev.serializeM = (m) => smsg(QasimDev, m, store);
 
     } catch (err) {
-        console.error(chalk.red("CRITICAL START ERROR:"), err.message);
-        setTimeout(startQasimDev, 10000);
+        console.error(chalk.red("💥 CRITICAL START ERROR:"), err.message);
+        setTimeout(startQasimDev, 15000);
     }
 }
 
 startQasimDev();
-    
+                   
