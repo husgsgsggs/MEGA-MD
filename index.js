@@ -21,7 +21,7 @@ const {
 const NodeCache = require("node-cache");
 const pino = require("pino");
 
-// Import the permanent storage library we created
+// Import the permanent storage library
 const { useMongoDBAuthState } = require('./lib/mongo_auth'); 
 
 const store = require('./lib/lightweight_store');
@@ -37,34 +37,39 @@ const {
 const settings = require('./settings');
 const commandHandler = require('./lib/commandHandler');
 
-// Initial Setup
+// Initial Setup & Database Write Interval
 store.readFromFile();
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000);
 commandHandler.loadCommands();
 
-// RAM Management: Prevents Sevalla from killing the bot due to high memory
+// RAM & Performance Management
 setInterval(() => {
     if (global.gc) global.gc();
 }, 60_000);
 
 setInterval(() => {
     const used = process.memoryUsage().rss / 1024 / 1024;
-    if (used > 450) {
-        console.log(chalk.red("RAM Limit reached, restarting..."));
+    if (used > 480) {
+        console.log(chalk.red("⚠️ Memory limit reached. Performing emergency restart..."));
         process.exit(1);
     }
 }, 30_000);
 
-// Keep the Port Open for Cron-job.org
-server.listen(PORT, () => printLog('success', `Server listening on port ${PORT}`));
+// Keep Port 3000 Open for Cron-job/Uptime
+server.listen(PORT, () => printLog('success', `Uptime Server running on port ${PORT}`));
 
 async function startQasimDev() {
     try {
         const { version } = await fetchLatestBaileysVersion();
         
-        // CORE FIX: Use MongoDB instead of local folder to prevent data loss
-        const { state, saveCreds } = await useMongoDBAuthState(global.mongodb || process.env.MONGO_URL);
-        
+        // MongoDB Auth System (Prevents 3-minute deletion on Sevalla)
+        const mongoUrl = global.mongodb || process.env.MONGO_URL;
+        if (!mongoUrl) {
+            console.error(chalk.red("❌ Error: MONGO_URL is missing in your config!"));
+            process.exit(1);
+        }
+
+        const { state, saveCreds } = await useMongoDBAuthState(mongoUrl);
         const msgRetryCounterCache = new NodeCache();
 
         // Get pairing number from Environment Variables
@@ -90,21 +95,21 @@ async function startQasimDev() {
             msgRetryCounterCache,
         });
 
-        // Pairing Code Support
+        // Pairing Code Support logic
         if (phoneNumber && !state.creds.registered) {
             setTimeout(async () => {
                 try {
                     let code = await QasimDev.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
                     code = code?.match(/.{1,4}/g)?.join("-") || code;
-                    console.log(chalk.black(chalk.bgGreen(`\n YOUR PAIRING CODE: `)), chalk.white.bold(code), `\n`);
+                    console.log(chalk.black(chalk.bgGreen(`\n 🔑 YOUR PAIRING CODE: `)), chalk.white.bold(code), `\n`);
                 } catch (e) { console.log("Pairing Error:", e); }
             }, 6000);
         }
 
-        // Save every credential change to MongoDB immediately
+        // Auto-Save Credentials to MongoDB
         QasimDev.ev.on('creds.update', async () => {
             await saveCreds();
-            console.log(chalk.cyan("📤 Session synced to MongoDB Cluster."));
+            console.log(chalk.cyan("📤 Session credentials synced to MongoDB."));
         });
 
         store.bind(QasimDev.ev);
@@ -117,24 +122,25 @@ async function startQasimDev() {
             }
 
             if (connection === 'open') {
-                printLog('success', '✅ Connected! Your session is now permanent.');
+                printLog('success', '✅ Connected! Your bot is now permanent.');
                 try {
                     const { startAutoBio } = require('./plugins/setbio');
                     startAutoBio(QasimDev);
-                } catch (e) { /* Bio plugin optional */ }
+                } catch (e) { /* Bio plugin check */ }
             }
 
             if (connection === 'close') {
                 let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
                 if (reason !== DisconnectReason.loggedOut) {
-                    startQasimDev(); // Auto-reconnect
+                    console.log(chalk.yellow("🔌 Connection lost. Reconnecting..."));
+                    startQasimDev();
                 } else {
-                    printLog('error', '⚠️ Logged out. Please re-pair your number.');
+                    printLog('error', '⚠️ Session Logged Out. Please re-pair your number.');
                 }
             }
         });
 
-        // Message Handling
+        // Event Listeners
         QasimDev.ev.on('messages.upsert', async (chatUpdate) => {
             try {
                 const mek = chatUpdate.messages[0];
@@ -169,9 +175,16 @@ async function startQasimDev() {
         QasimDev.serializeM = (m) => smsg(QasimDev, m, store);
 
     } catch (err) {
-        console.error("Initialization Error:", err);
+        console.error("Initialization Crash:", err);
         setTimeout(startQasimDev, 10000);
     }
 }
 
+// Global Crash Prevention
+process.on('uncaughtException', (err) => {
+    console.error('CRITICAL ERROR:', err);
+    startQasimDev();
+});
+
 startQasimDev();
+    
