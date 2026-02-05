@@ -407,14 +407,10 @@ async function startQasimDev() {
                 printLog('info', `Using phone number from environment: ${phoneNumberInput}`);
             } else if (rl && !rl.closed) {
                 phoneNumberInput = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 6281376552730 (without + or spaces) : `)));
-            } else if (phoneNumber) {
-    phoneNumberInput = phoneNumber;
-    printLog('info', `Using default phone number: ${phoneNumberInput}`);
-} else {
-    printLog('warning', 'No phone number for pairing. Please use QR code in terminal/logs.');
-    return; // Stop the pairing process if no number is found
-}
-
+            } else {
+                phoneNumberInput = phoneNumber;
+                printLog('info', `Using default phone number: ${phoneNumberInput}`);
+            }
 
             phoneNumberInput = phoneNumberInput.replace(/[^0-9]/g, '');
 
@@ -510,4 +506,7 @@ async function startQasimDev() {
                 console.log(chalk.green(`${global.themeemoji || '•'} 🤖 Bot Connected Successfully! ✅`));
                 console.log(chalk.blue(`Bot Version: ${settings.version}`));
                 console.log(chalk.cyan(`Loaded Commands: ${commandHandler.commands.size}`));
-                console.log(chalk.cyan(`Prefixes: ${
+                console.log(chalk.cyan(`Prefixes: ${settings.prefixes.join(', ')}`));
+                console.log(chalk.gray(`Backend: ${store.getStats().backend}`));
+                console.log();
+ 
