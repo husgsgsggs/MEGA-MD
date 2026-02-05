@@ -61,7 +61,10 @@ async function startQasimDev() {
         const sessionPath = './session';
         if (!existsSync(sessionPath)) mkdirSync(sessionPath);
         
-        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+        // This replaces the local folder save with a MongoDB save
+        const { useMongoDBAuthState } = require('./lib/mongo_auth'); // Ensure this file exists in your lib
+        const { state, saveCreds } = await useMongoDBAuthState(process.env.MONGO_URL);
+        
         const msgRetryCounterCache = new NodeCache();
 
         // Get pairing number from Environment Variables
