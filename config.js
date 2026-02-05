@@ -17,6 +17,13 @@ global.APIs = {
     fgmods: 'https://api-fgmods.ddns.net'
 };
 
+// Database Configuration
+global.mongodb = process.env.MONGO_URL || "mongodb+srv://hawabazi56_db_user:bV0HMPrlcIuxGY0Z@cluster0.ro4avbq.mongodb.net/MEGA-MD?retryWrites=true&w=majority";
+
+// Ensure the bot uses the database for the session
+global.DATABASE_URL = global.mongodb;
+
+
 global.APIKeys = {
     'https://api.xteam.xyz': 'd90a9e986e18778b',
     'https://api.lolhuman.xyz': '85faf717d0545d14074659ad',
