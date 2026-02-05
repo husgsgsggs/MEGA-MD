@@ -37,42 +37,44 @@ const {
 const settings = require('./settings');
 const commandHandler = require('./lib/commandHandler');
 
-// Initial Setup & Database Write Interval
+// Initial Setup
 store.readFromFile();
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000);
 commandHandler.loadCommands();
 
-// RAM & Performance Management
+// RAM Management for Sevalla (Prevents OOM crashes)
 setInterval(() => {
     if (global.gc) global.gc();
 }, 60_000);
 
 setInterval(() => {
     const used = process.memoryUsage().rss / 1024 / 1024;
-    if (used > 480) {
-        console.log(chalk.red("⚠️ Memory limit reached. Performing emergency restart..."));
+    if (used > 450) {
+        console.log(chalk.red("RAM Limit high, restarting process..."));
         process.exit(1);
     }
 }, 30_000);
 
-// Keep Port 3000 Open for Cron-job/Uptime
-server.listen(PORT, () => printLog('success', `Uptime Server running on port ${PORT}`));
+// Keep Uptime Port Open
+server.listen(PORT, () => printLog('success', `Bot server alive on port ${PORT}`));
 
 async function startQasimDev() {
     try {
         const { version } = await fetchLatestBaileysVersion();
         
-        // MongoDB Auth System (Prevents 3-minute deletion on Sevalla)
+        // 1. DATABASE SYNC: Wait for MongoDB to be 100% ready
+        console.log(chalk.yellow("⏳ Synchronizing with MongoDB..."));
         const mongoUrl = global.mongodb || process.env.MONGO_URL;
+        
         if (!mongoUrl) {
-            console.error(chalk.red("❌ Error: MONGO_URL is missing in your config!"));
-            process.exit(1);
+            console.error(chalk.red("❌ Error: MONGO_URL not found in config.js or Environment Variables."));
+            return;
         }
 
         const { state, saveCreds } = await useMongoDBAuthState(mongoUrl);
-        const msgRetryCounterCache = new NodeCache();
+        console.log(chalk.green("✅ Database Synced. Initializing Connection..."));
 
-        // Get pairing number from Environment Variables
+        const msgRetryCounterCache = new NodeCache();
         let phoneNumber = process.env.PAIRING_NUMBER || global.PAIRING_NUMBER || "";
 
         const QasimDev = makeWASocket({
@@ -95,21 +97,22 @@ async function startQasimDev() {
             msgRetryCounterCache,
         });
 
-        // Pairing Code Support logic
+        // 2. PAIRING LOGIC: Delayed to ensure keys are populated
         if (phoneNumber && !state.creds.registered) {
             setTimeout(async () => {
                 try {
                     let code = await QasimDev.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
                     code = code?.match(/.{1,4}/g)?.join("-") || code;
                     console.log(chalk.black(chalk.bgGreen(`\n 🔑 YOUR PAIRING CODE: `)), chalk.white.bold(code), `\n`);
-                } catch (e) { console.log("Pairing Error:", e); }
-            }, 6000);
+                } catch (e) { 
+                    console.log(chalk.red("Pairing Error:"), e.message); 
+                }
+            }, 10000);
         }
 
-        // Auto-Save Credentials to MongoDB
+        // Auto-save to Mongo
         QasimDev.ev.on('creds.update', async () => {
             await saveCreds();
-            console.log(chalk.cyan("📤 Session credentials synced to MongoDB."));
         });
 
         store.bind(QasimDev.ev);
@@ -122,25 +125,25 @@ async function startQasimDev() {
             }
 
             if (connection === 'open') {
-                printLog('success', '✅ Connected! Your bot is now permanent.');
+                printLog('success', '✅ Connected! Your session is permanently stored in MongoDB.');
                 try {
                     const { startAutoBio } = require('./plugins/setbio');
                     startAutoBio(QasimDev);
-                } catch (e) { /* Bio plugin check */ }
+                } catch (e) {}
             }
 
             if (connection === 'close') {
                 let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
                 if (reason !== DisconnectReason.loggedOut) {
-                    console.log(chalk.yellow("🔌 Connection lost. Reconnecting..."));
+                    console.log(chalk.cyan("🔌 Connection closed. Restarting..."));
                     startQasimDev();
                 } else {
-                    printLog('error', '⚠️ Session Logged Out. Please re-pair your number.');
+                    printLog('error', '⚠️ Logged out. Delete the "auth" collection in MongoDB and re-pair.');
                 }
             }
         });
 
-        // Event Listeners
+        // Event Handling
         QasimDev.ev.on('messages.upsert', async (chatUpdate) => {
             try {
                 const mek = chatUpdate.messages[0];
@@ -175,16 +178,10 @@ async function startQasimDev() {
         QasimDev.serializeM = (m) => smsg(QasimDev, m, store);
 
     } catch (err) {
-        console.error("Initialization Crash:", err);
+        console.error("Critical Start Error:", err);
         setTimeout(startQasimDev, 10000);
     }
 }
-
-// Global Crash Prevention
-process.on('uncaughtException', (err) => {
-    console.error('CRITICAL ERROR:', err);
-    startQasimDev();
-});
 
 startQasimDev();
     
