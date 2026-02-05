@@ -10,7 +10,6 @@ const path = require('path');
 const qrcode = require('qrcode-terminal');
 const {
     default: makeWASocket,
-    useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
     Browsers,
@@ -21,7 +20,9 @@ const {
 } = require("@whiskeysockets/baileys");
 const NodeCache = require("node-cache");
 const pino = require("pino");
-const { existsSync, mkdirSync } = require('fs');
+
+// Import the permanent storage library we created
+const { useMongoDBAuthState } = require('./lib/mongo_auth'); 
 
 const store = require('./lib/lightweight_store');
 const { server, PORT } = require('./lib/server');
@@ -41,29 +42,28 @@ store.readFromFile();
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000);
 commandHandler.loadCommands();
 
-// RAM Management
+// RAM Management: Prevents Sevalla from killing the bot due to high memory
 setInterval(() => {
     if (global.gc) global.gc();
 }, 60_000);
 
 setInterval(() => {
     const used = process.memoryUsage().rss / 1024 / 1024;
-    if (used > 450) process.exit(1);
+    if (used > 450) {
+        console.log(chalk.red("RAM Limit reached, restarting..."));
+        process.exit(1);
+    }
 }, 30_000);
 
+// Keep the Port Open for Cron-job.org
 server.listen(PORT, () => printLog('success', `Server listening on port ${PORT}`));
 
 async function startQasimDev() {
     try {
         const { version } = await fetchLatestBaileysVersion();
         
-        // Ensure local session folder
-        const sessionPath = './session';
-        if (!existsSync(sessionPath)) mkdirSync(sessionPath);
-        
-        // This replaces the local folder save with a MongoDB save
-        const { useMongoDBAuthState } = require('./lib/mongo_auth'); // Ensure this file exists in your lib
-        const { state, saveCreds } = await useMongoDBAuthState(process.env.MONGO_URL);
+        // CORE FIX: Use MongoDB instead of local folder to prevent data loss
+        const { state, saveCreds } = await useMongoDBAuthState(global.mongodb || process.env.MONGO_URL);
         
         const msgRetryCounterCache = new NodeCache();
 
@@ -90,7 +90,7 @@ async function startQasimDev() {
             msgRetryCounterCache,
         });
 
-        // FORCED PAIRING CODE LOGIC
+        // Pairing Code Support
         if (phoneNumber && !state.creds.registered) {
             setTimeout(async () => {
                 try {
@@ -101,10 +101,10 @@ async function startQasimDev() {
             }, 6000);
         }
 
-        // AGGRESSIVE SYNC TO MONGODB
+        // Save every credential change to MongoDB immediately
         QasimDev.ev.on('creds.update', async () => {
             await saveCreds();
-            console.log(chalk.cyan("📤 Session synced to MongoDB."));
+            console.log(chalk.cyan("📤 Session synced to MongoDB Cluster."));
         });
 
         store.bind(QasimDev.ev);
@@ -117,22 +117,24 @@ async function startQasimDev() {
             }
 
             if (connection === 'open') {
-                printLog('success', '✅ Connected! Session saved to MongoDB.');
-                const { startAutoBio } = require('./plugins/setbio');
-                startAutoBio(QasimDev);
+                printLog('success', '✅ Connected! Your session is now permanent.');
+                try {
+                    const { startAutoBio } = require('./plugins/setbio');
+                    startAutoBio(QasimDev);
+                } catch (e) { /* Bio plugin optional */ }
             }
 
             if (connection === 'close') {
                 let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
                 if (reason !== DisconnectReason.loggedOut) {
-                    startQasimDev();
+                    startQasimDev(); // Auto-reconnect
                 } else {
-                    printLog('error', '⚠️ Logged out. Delete session folder and re-pair.');
+                    printLog('error', '⚠️ Logged out. Please re-pair your number.');
                 }
             }
         });
 
-        // Event Handling
+        // Message Handling
         QasimDev.ev.on('messages.upsert', async (chatUpdate) => {
             try {
                 const mek = chatUpdate.messages[0];
@@ -167,10 +169,9 @@ async function startQasimDev() {
         QasimDev.serializeM = (m) => smsg(QasimDev, m, store);
 
     } catch (err) {
-        console.error(err);
+        console.error("Initialization Error:", err);
         setTimeout(startQasimDev, 10000);
     }
 }
 
 startQasimDev();
-    
