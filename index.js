@@ -22,7 +22,7 @@ const NodeCache = require("node-cache");
 const pino = require("pino");
 const mongoose = require("mongoose");
 
-// Import the permanent storage library
+// Import the auth library
 const { useMongoDBAuthState } = require('./lib/mongo_auth'); 
 
 const store = require('./lib/lightweight_store');
@@ -38,46 +38,42 @@ const {
 const settings = require('./settings');
 const commandHandler = require('./lib/commandHandler');
 
-// Initial Setup & Database Write Interval
+// Initial Setup
 store.readFromFile();
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000);
 commandHandler.loadCommands();
 
-// RAM & Performance Management for Sevalla
+// RAM Monitoring to prevent Sevalla from killing the process
 setInterval(() => {
     if (global.gc) global.gc();
-}, 60_000);
-
-setInterval(() => {
     const used = process.memoryUsage().rss / 1024 / 1024;
-    if (used > 480) {
-        console.log(chalk.red("⚠️ Memory limit reached. Performing emergency restart..."));
+    if (used > 450) {
+        console.log(chalk.red("⚠️ High RAM usage. Restarting to stay stable..."));
         process.exit(1);
     }
 }, 30_000);
 
-// Keep Port 3000/8080 Open for Uptime
-server.listen(PORT, () => printLog('success', `Uptime Server running on port ${PORT}`));
+// Keep Uptime Port Active
+server.listen(PORT, () => printLog('success', `Uptime Server live on port ${PORT}`));
 
 async function startQasimDev() {
     try {
         const mongoUrl = global.mongodb || process.env.MONGO_URL;
         
-        // 1. HARD LOCK: Establishing Database Connection First
-        console.log(chalk.yellow("📡 Phase 1: Establishing Stable Database Connection..."));
+        // 1. THE HARD GATE: Bot will not move past this line until DB is 100% connected
+        console.log(chalk.yellow("⏳ Step 1: Connecting to MongoDB (Waiting for handshake)..."));
         if (!mongoUrl) {
-            console.error(chalk.red("❌ Error: MONGO_URL is missing in your config!"));
+            console.error(chalk.red("❌ ERROR: MONGO_URL missing in config.js or Environment Variables."));
             return;
         }
-        
-        await mongoose.connect(mongoUrl);
-        console.log(chalk.green("✅ Phase 2: Database Connected. Syncing Auth State..."));
+
+        // Wait for connection to prevent "undefined collection" error
+        await mongoose.connect(mongoUrl, { serverSelectionTimeoutMS: 5000 });
+        console.log(chalk.green("✅ Step 2: Database Connected. Synchronizing auth..."));
 
         const { state, saveCreds } = await useMongoDBAuthState(mongoUrl);
         const { version } = await fetchLatestBaileysVersion();
         const msgRetryCounterCache = new NodeCache();
-
-        // Get pairing number from Environment Variables
         let phoneNumber = process.env.PAIRING_NUMBER || global.PAIRING_NUMBER || "";
 
         const QasimDev = makeWASocket({
@@ -90,7 +86,6 @@ async function startQasimDev() {
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" })),
             },
             markOnlineOnConnect: true,
-            generateHighQualityLinkPreview: true,
             syncFullHistory: false,
             getMessage: async (key) => {
                 let jid = jidNormalizedUser(key.remoteJid);
@@ -100,22 +95,21 @@ async function startQasimDev() {
             msgRetryCounterCache,
         });
 
-        // 2. MAXIMUM STABILITY LOCK: 60-second delay for Pairing Code
+        // 2. STABILITY DELAY: Prevents Pairing Error
         if (phoneNumber && !state.creds.registered) {
-            console.log(chalk.blue("⏳ Stability Lock: Waiting 60 seconds for database replication..."));
+            console.log(chalk.blue("⏳ Stability Lock: Syncing security keys (60s wait)..."));
             setTimeout(async () => {
                 try {
-                    console.log(chalk.cyan("🔑 Handshaking and Requesting Pairing Code..."));
+                    console.log(chalk.cyan("🔑 Handshaking with WhatsApp..."));
                     let code = await QasimDev.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
                     code = code?.match(/.{1,4}/g)?.join("-") || code;
-                    console.log(chalk.black(chalk.bgGreen(`\n 🔑 YOUR STABLE PAIRING CODE: `)), chalk.white.bold(code), `\n`);
+                    console.log(chalk.black(chalk.bgGreen(`\n 🔑 YOUR PAIRING CODE: `)), chalk.white.bold(code), `\n`);
                 } catch (e) { 
-                    console.log(chalk.red("❌ Pairing Error (Keys not ready):"), e.message); 
+                    console.log(chalk.red("❌ Pairing Error (Retrying in next loop):"), e.message);
                 }
-            }, 60000); // 60s delay to prevent "Received undefined" errors
+            }, 60000); 
         }
 
-        // Auto-Save Credentials
         QasimDev.ev.on('creds.update', async () => {
             await saveCreds();
         });
@@ -130,32 +124,31 @@ async function startQasimDev() {
             }
 
             if (connection === 'open') {
-                printLog('success', '✅ SUCCESS: Connected! Your bot is now permanent.');
+                printLog('success', '✅ SUCCESS: Bot is connected and stable!');
             }
 
             if (connection === 'close') {
                 let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
                 if (reason !== DisconnectReason.loggedOut) {
-                    console.log(chalk.yellow("🔌 Connection lost. Cooling down for 10s before restart..."));
-                    await delay(10000);
+                    // 3. COOL-DOWN RESTART: Prevents the rapid restart crash loop
+                    console.log(chalk.cyan("🔌 Connection closed. Cooling down for 15s before restart..."));
+                    await delay(15000);
                     startQasimDev();
                 } else {
-                    printLog('error', '⚠️ Session Logged Out. Please clear MongoDB and re-pair.');
+                    printLog('error', '⚠️ Logged out. Delete the "auth" collection in MongoDB and re-pair.');
                 }
             }
         });
 
-        // Message & Event Listeners
+        // Handler Logic
         QasimDev.ev.on('messages.upsert', async (chatUpdate) => {
             try {
                 const mek = chatUpdate.messages[0];
                 if (!mek.message) return;
-                
                 if (mek.key && mek.key.remoteJid === 'status@broadcast') {
                     await handleStatus(QasimDev, chatUpdate);
                     return;
                 }
-                
                 await handleMessages(QasimDev, chatUpdate);
             } catch (err) { console.error(err); }
         });
@@ -181,9 +174,8 @@ async function startQasimDev() {
 
     } catch (err) {
         console.error(chalk.red("💥 CRITICAL START ERROR:"), err.message);
-        setTimeout(startQasimDev, 15000);
+        setTimeout(startQasimDev, 20000); // 20s recovery delay
     }
 }
 
 startQasimDev();
-                   
