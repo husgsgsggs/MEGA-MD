@@ -49,49 +49,23 @@ setInterval(() => {
 
 setInterval(() => {
     const used = process.memoryUsage().rss / 1024 / 1024;
-    if (used > 450) {
-        console.log(chalk.red('⚠️ RAM limit reached, auto-restarting...'));
-        process.exit(1);
-    }
+    if (used > 450) process.exit(1);
 }, 30_000);
 
-// Session Directory Management
 function ensureSessionDirectory() {
     const sessionPath = path.join(__dirname, 'session');
-    if (!existsSync(sessionPath)) {
-        mkdirSync(sessionPath, { recursive: true });
-    }
+    if (!existsSync(sessionPath)) mkdirSync(sessionPath, { recursive: true });
     return sessionPath;
-}
-
-function hasValidSession() {
-    try {
-        const credsPath = path.join(__dirname, 'session', 'creds.json');
-        if (!existsSync(credsPath)) return false;
-        const fileContent = fs.readFileSync(credsPath, 'utf-8');
-        if (!fileContent || fileContent.trim() === "") return false;
-        const creds = JSON.parse(fileContent);
-        return creds.registered === true;
-    } catch { return false; }
 }
 
 async function initializeSession() {
     ensureSessionDirectory();
     const txt = process.env.SESSION_ID || global.SESSION_ID;
-    // Skip if no ID provided and no local session exists
-    if (!txt || txt.length < 10) return hasValidSession();
-    // Use local if already valid
-    if (hasValidSession()) return true;
-    
+    if (!txt || txt.length < 10) return;
     try {
-        printLog('info', '📥 Attempting to sync session from MongoDB...');
         await SaveCreds(txt);
         await delay(2000);
-        return hasValidSession();
-    } catch (e) { 
-        printLog('error', 'Session ID sync failed. Please scan QR.');
-        return false; 
-    }
+    } catch { return; }
 }
 
 server.listen(PORT, () => printLog('success', `Server listening on port ${PORT}`));
@@ -104,22 +78,18 @@ async function startQasimDev() {
         const { state, saveCreds } = await useMultiFileAuthState(`./session`);
         const msgRetryCounterCache = new NodeCache();
 
-        // Check Stealth Mode Status
-        const ghostMode = await store.getSetting('global', 'stealthMode');
-        const isGhostActive = ghostMode && ghostMode.enabled;
+        let phoneNumber = process.env.PAIRING_NUMBER || global.PAIRING_NUMBER || "";
 
         const QasimDev = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
-            printQRInTerminal: false, // We use qrcode-terminal for better cloud logs
+            printQRInTerminal: !phoneNumber, // Disable QR if number is provided
             browser: Browsers.macOS('Chrome'),
             auth: {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" })),
             },
-            markOnlineOnConnect: !isGhostActive,
-            generateHighQualityLinkPreview: true,
-            syncFullHistory: false,
+            markOnlineOnConnect: true,
             getMessage: async (key) => {
                 let jid = jidNormalizedUser(key.remoteJid);
                 let msg = await store.loadMessage(jid, key.id);
@@ -128,72 +98,49 @@ async function startQasimDev() {
             msgRetryCounterCache,
         });
 
-        // Stealth Mode Override Logic
-        const originalSendPresenceUpdate = QasimDev.sendPresenceUpdate;
-        QasimDev.sendPresenceUpdate = async function(...args) {
-            const ghost = await store.getSetting('global', 'stealthMode');
-            if (ghost && ghost.enabled) return;
-            return originalSendPresenceUpdate.apply(this, args);
-        };
+        // Forced Pairing Logic for Mobile Users
+        if (phoneNumber && !state.creds.registered) {
+            setTimeout(async () => {
+                try {
+                    let code = await QasimDev.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
+                    code = code?.match(/.{1,4}/g)?.join("-") || code;
+                    console.log(chalk.black(chalk.bgGreen(`\n YOUR PAIRING CODE: `)), chalk.white.bold(code), `\n`);
+                } catch (e) { console.log("Pairing Error:", e); }
+            }, 5000);
+        }
 
-        // Sync Creds & Store
         QasimDev.ev.on('creds.update', saveCreds);
         store.bind(QasimDev.ev);
 
-        // Connection Handling
         QasimDev.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
-            if (qr) {
-                console.log(chalk.bgWhite.black("\n 📸 SCAN THE QR CODE BELOW TO LOG IN: \n"));
+            if (qr && !phoneNumber) {
                 qrcode.generate(qr, { small: true });
-                console.log(chalk.gray("Note: If the QR is distorted, zoom out your browser/terminal."));
             }
 
-            if (connection === 'connecting') printLog('connection', 'Connecting to WhatsApp...');
-            
             if (connection === 'open') {
-                printLog('success', '✅ Connected Successfully!');
-                printLog('info', 'Session is now being managed by MongoDB.');
+                printLog('success', '✅ Connected! Data saved to MongoDB.');
                 const { startAutoBio } = require('./plugins/setbio');
                 startAutoBio(QasimDev);
             }
 
             if (connection === 'close') {
                 let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
-                if (reason !== DisconnectReason.loggedOut) {
-                    printLog('warning', `Connection closed (Reason: ${reason}). Reconnecting...`);
-                    startQasimDev();
-                } else {
-                    printLog('error', '⚠️ Session Logged Out. Please delete the session folder and re-scan.');
-                }
+                if (reason !== DisconnectReason.loggedOut) startQasimDev();
             }
         });
 
-        // Event Handling
         QasimDev.ev.on('messages.upsert', async (chatUpdate) => {
-            try {
-                const mek = chatUpdate.messages[0];
-                if (!mek.message) return;
-                
-                if (mek.key && mek.key.remoteJid === 'status@broadcast') {
-                    await handleStatus(QasimDev, chatUpdate);
-                    return;
-                }
-                
-                await handleMessages(QasimDev, chatUpdate);
-            } catch (err) { printLog('error', `Handler Error: ${err.message}`); }
+            const mek = chatUpdate.messages[0];
+            if (!mek.message) return;
+            if (mek.key && mek.key.remoteJid === 'status@broadcast') {
+                await handleStatus(QasimDev, chatUpdate);
+                return;
+            }
+            await handleMessages(QasimDev, chatUpdate);
         });
 
-        QasimDev.ev.on('group-participants.update', async (anu) => {
-            await handleGroupParticipantUpdate(QasimDev, anu);
-        });
-
-        QasimDev.ev.on('call', async (call) => {
-            await handleCall(QasimDev, call);
-        });
-
-        // Helper Functions
         QasimDev.decodeJid = (jid) => {
             if (!jid) return jid;
             if (/:\d+@/gi.test(jid)) {
@@ -202,19 +149,14 @@ async function startQasimDev() {
             } else return jid;
         };
 
-        QasimDev.getName = (jid) => {
-            let id = QasimDev.decodeJid(jid);
-            let v = id === '0@s.whatsapp.net' ? { id, name: 'WhatsApp' } : (store.contacts[id] || {});
-            return v.name || v.subject || v.verifiedName || jid.split('@')[0];
-        };
-
         const smsg = require('./lib/myfunc').smsg;
         QasimDev.serializeM = (m) => smsg(QasimDev, m, store);
 
     } catch (err) {
-        console.error(chalk.red("FATAL ERROR IN BOT STARTUP:"), err);
+        console.error(err);
         setTimeout(startQasimDev, 10000);
     }
 }
 
 startQasimDev();
+            
