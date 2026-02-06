@@ -1,5 +1,3 @@
-/* process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; */
-
 require('./config');
 require('./settings');
 const { Boom } = require('@hapi/boom');
@@ -18,7 +16,7 @@ const { useMongoDBAuthState } = require('./lib/mongo_auth');
 const { server, PORT } = require('./lib/server');
 const { handleMessages } = require('./lib/messageHandler');
 
-server.listen(PORT, () => console.log(chalk.green(`✅ Keep-alive server running on port ${PORT}`)));
+server.listen(PORT, () => console.log(chalk.green(`✅ Keep-alive server on port ${PORT}`)));
 
 async function startQasimDev() {
     try {
@@ -26,11 +24,10 @@ async function startQasimDev() {
         
         console.log(chalk.yellow("📡 Connecting to MongoDB..."));
         
-        // Step 1: Force wait for MongoDB connection
-        await mongoose.connect(mongoUrl, { useNewUrlParser: true, useUnifiedTopology: true });
-        console.log(chalk.green("✅ DB Connected."));
+        // STAGE 1: Wait for Database
+        await mongoose.connect(mongoUrl);
+        console.log(chalk.green("✅ DB Connected. Initializing Auth..."));
 
-        // Step 2: Load authentication state from Mongo
         const { state, saveCreds } = await useMongoDBAuthState(mongoUrl);
         const { version } = await fetchLatestBaileysVersion();
         
@@ -45,25 +42,26 @@ async function startQasimDev() {
             },
         });
 
-        // Step 3: Pairing Code Logic
+        // STAGE 2: Pairing Code Logic with Stability Delay
         let phoneNumber = process.env.PAIRING_NUMBER || global.PAIRING_NUMBER;
         
-        // We only request a code if there is a number AND we aren't already registered in the DB
         if (phoneNumber && !QasimDev.authState.creds.registered) {
-            console.log(chalk.blue(`⏳ Preparing pairing code for: ${phoneNumber}`));
+            console.log(chalk.blue(`⏳ [STABILITY] Waiting 15s before requesting code for ${phoneNumber}...`));
             
-            // Wait 10 seconds to ensure the socket is stable before requesting
-            await delay(10000); 
-            
+            // This delay prevents "Connection Closed" by letting the socket finish handshake
+            await delay(15000); 
+
             try {
+                console.log(chalk.cyan("🔑 Requesting code now..."));
                 let code = await QasimDev.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
                 code = code?.match(/.{1,4}/g)?.join("-") || code;
-                console.log(chalk.black.bgCyan(`\n PAIRING CODE: `), chalk.white.bold.bgMagenta(` ${code} `), `\n`);
+                console.log(chalk.black.bgCyan(`\n YOUR PAIRING CODE: `), chalk.white.bold.bgMagenta(` ${code} `), `\n`);
             } catch (err) {
                 console.log(chalk.red("❌ Pairing Request Failed:"), err.message);
+                // If it fails, we wait and retry once
+                setTimeout(startQasimDev, 10000);
+                return;
             }
-        } else if (QasimDev.authState.creds.registered) {
-            console.log(chalk.cyan("♻️ Session loaded from MongoDB. Auto-logging in..."));
         }
 
         QasimDev.ev.on('creds.update', saveCreds);
@@ -72,19 +70,16 @@ async function startQasimDev() {
             const { connection, lastDisconnect } = update;
             
             if (connection === 'open') {
-                console.log(chalk.green.bold('✅ SUCCESS: Bot is Online!'));
+                console.log(chalk.green.bold('✅ SUCCESS: Bot is Online! Session saved to MongoDB.'));
             }
             
             if (connection === 'close') {
                 let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
-                
-                if (reason === DisconnectReason.restartRequired) {
+                if (reason !== DisconnectReason.loggedOut) {
+                    console.log(chalk.yellow(`🔌 Connection closed (${reason}). Reconnecting...`));
                     startQasimDev();
-                } else if (reason === DisconnectReason.loggedOut) {
-                    console.log(chalk.red("❌ Logged out. You must clear your MongoDB collection to re-pair."));
                 } else {
-                    console.log(chalk.yellow(`🔌 Connection lost (${reason}). Reconnecting in 5s...`));
-                    setTimeout(startQasimDev, 5000);
+                    console.log(chalk.red("❌ Logged out. Reset your MongoDB 'auth' collection to re-pair."));
                 }
             }
         });
@@ -99,9 +94,8 @@ async function startQasimDev() {
     }
 }
 
-// Global safety net to stop Sevalla from crashing on every small error
-process.on('uncaughtException', (err) => console.error("Critical Exception:", err.message));
-process.on('unhandledRejection', (err) => console.error("Uncaught Promise:", err.message));
+// Global safety catch
+process.on('uncaughtException', (err) => console.error("Critical:", err.message));
+process.on('unhandledRejection', (err) => console.error("Promise Error:", err.message));
 
 startQasimDev();
-    
